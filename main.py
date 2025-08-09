@@ -10,120 +10,114 @@ from langchain.chat_models import init_chat_model
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.tools import tool
-from langchain_core.messages import (
-    HumanMessage,
-    AIMessage,
-    ToolMessage,
-)
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 
-from langgraph.graph import StateGraph, END, add_messages
-from langgraph.prebuilt import ToolNode
+# from langgraph.graph import StateGraph, END, add_messages
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 from typing_extensions import List, TypedDict
 
 load_dotenv()
 
 
-def set_openai_api_key():
+class ConversationManager:
+    def __init__(self):
+        self.vector_store = None
+        self.embeddings = OpenAIEmbeddings()
+        self.llm = init_chat_model("gpt-4o-mini", model_provider="openai")
+        print("ConversationManager initialized...")
+
+    @tool
+    def add_document_from_url(self, url: str) -> str:
+        """Scrapes the content from the given URL and adds it to the knowledge base.
+        Use this tool when a user provides a URL to a document that can be read."""
+        print("=== TOOL: ADD DOCUMENT FROM URL ===")
+        try:
+            loader = WebBaseLoader(web_paths=[url])
+            docs = loader.load()
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                add_start_index=True,
+                separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
+            )
+            splitted_docs = text_splitter.split_documents(docs)
+
+            if self.vector_store is None:
+                print("Creating new vector store...")
+                self.vector_store = FAISS.from_documents(
+                    documents=splitted_docs, embedding=self.embeddings
+                )
+            else:
+                print("Adding to existing vector store...")
+                self.vector_store.add_documents(splitted_docs)
+
+            return f"Successfully added document from {url} to the knowledge base."
+        except Exception as e:
+            return f"Error loading document from {url}: {e}"
+
+    @tool
+    def query_knowledge_base(self, question: str) -> str:
+        """Answer the user's question based on the knowledge base.
+        Use this tool when the user asks a question that isn't a URL."""
+        print("=== TOOL: QUERY KNOWLEDGE BASE ===")
+        if self.vector_store is None:
+            return "No documents found in knowledge base. Please add a document first."
+
+        retriever = self.vector_store.as_retriever(search_kwargs={"k": 4})
+
+        prompt = ChatPromptTemplate.from_template(
+            "Answer the user's question based on the following context:\n\n<context>{context}</context>\n\nQuestion: {question}"
+        )
+
+        document_chain = create_stuff_documents_chain(self.llm, prompt)
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
+
+        response = retrieval_chain.invoke({"question": question})
+        return response["answer"]
+
+
+def main():
+    print("Hello from python-rag!")
     if not os.environ.get("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = getpass.getpass("OpenAI API Key: ")
     print("OpenAI API Key set.")
 
-# 1. Define the State for the Graph
-class MessagesState(TypedDict):
-    messages: Annotated[list, add_messages]
+    manager = ConversationManager()
+    tools = [manager.add_document_from_url, manager.query_knowledge_base]
 
-# 2. Define the tool
-def setup_retriever():
-    print("=== NODE: SETUP RETRIEVER ===")
-    loader = WebBaseLoader(web_paths=["https://lilianweng.github.io/posts/2023-06-23-agent/"])
-    docs = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        add_start_index=True,
-        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
+    memory = MemorySaver()
+    agent_executor = create_react_agent(manager.llm, tools, checkpointer=memory)
+    print("ReAct agent with memory created successfully.")
+
+    # Run the conversational agent
+    config = {"configurable": {"thread_id": "user_convo_2"}}
+    print(
+        "\n=== Agent is ready. You can now provide URLs to add the knowledge base or ask questions about them. ==="
     )
-    splitted_docs = text_splitter.split_documents(docs)
-    vectorstore = FAISS.from_documents(documents=splitted_docs, embedding=OpenAIEmbeddings())
-    return vectorstore.as_retriever(search_kwargs={"k": 4})
+    print("Type 'exit' to end the conversation! ===\n")
 
-retriever = setup_retriever()
+    while True:
+        user_input = input("\n\nYou: ")
+        if user_input.lower() in ("exit", "quit"):
+            print("Agent: Goodbye!")
+            break
 
-@tool
-def retrieve_documents(query: str) -> List[Document]:
-    """Looks up relevant documents from a knowledge base based on the user's query."""
-    print("=== TOOL: RETRIEVE ===")
-    retrieved_docs = retriever.invoke(query)
-    return [doc.__dict__ for doc in retrieved_docs]
-
-# 3. Define the nodes - the "brain" of the agent
-def call_model(state: MessagesState, llm_with_tools):
-    print("=== NODE: CALL MODEL ===")
-    messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
-    return {"messages": [response]}
-
-def call_tool(state: MessagesState):
-    last_message = state["messages"][-1]
-
-    tool_call = last_message.tool_calls[0]
-    if tool_call["name"] == "retrieve_documents":
-        tool_output = retrieve_documents.invoke(tool_call["args"])
-        return {"messages": [ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"])]}
-    return state
-
-# Conditional edge decides whether to continue the loop or end the graph
-def should_continue(state: MessagesState) -> str:
-    last_message = state["messages"][-1]
-    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-        return END
-    return "call_tool"
-
-def main():
-    print("Hello from python-rag!")
-    set_openai_api_key()
-    llm = init_chat_model("gpt-4o-mini", model_provider="openai")
-
-    # Create a new llm with the tool bound to it
-    llm_with_tools = llm.bind_tools([retrieve_documents])
-
-    # Create a new StateGraph with our defined state
-    workflow = StateGraph(MessagesState)
-
-    # Use partial to "bake" the llm_with_tools into our node function
-    model_node = partial(call_model, llm_with_tools=llm_with_tools)
-
-    # Add nodes to the graph
-    workflow.add_node("agent", model_node)
-    workflow.add_node("call_tool", call_tool)
-
-    # Define the flow of the graph
-    workflow.set_entry_point("agent")
-    workflow.add_conditional_edges("agent", should_continue, {
-        "call_tool": "call_tool",
-        END: END,
-    })
-    workflow.add_edge("call_tool", "agent")
-
-    app = workflow.compile()
-    print("Compiled workflow.")
-
-    display(Image(app.get_graph().draw_mermaid_png()))
-
-    query = input("\nEnter your query: ")
-    print("\n === Executing workflow === ")
-    final_state = app.invoke({"messages": [HumanMessage(content=query)]})
-    print("\n === Workflow completed === ")
-
-    final_answer = final_state["messages"][-1]
-    print("Final answer: ", final_answer.content)
-
-    print("\n === FULL MESSAGE HISTORY ===")
-    for message in final_state["messages"]:
-        print(f"**{message.type.upper()}**:\n{message.content}\n")
+        events = agent_executor.stream(
+            {"messages": [HumanMessage(content=user_input)]},
+            config,
+            stream_mode="values",
+        )
+        for event in events:
+            if "messages" in event:
+                event["messages"][-1].pretty_print()
 
 
 if __name__ == "__main__":
