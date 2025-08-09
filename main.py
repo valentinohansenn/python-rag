@@ -1,6 +1,6 @@
 import os
 import getpass
-import bs4
+from typing import Annotated
 
 from functools import partial
 from dotenv import load_dotenv
@@ -11,11 +11,16 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
+from langchain_core.tools import tool
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+)
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, add_messages
+from langgraph.prebuilt import ToolNode
 from typing_extensions import List, TypedDict
 
 load_dotenv()
@@ -26,113 +31,82 @@ def set_openai_api_key():
         os.environ["OPENAI_API_KEY"] = getpass.getpass("OpenAI API Key: ")
     print("OpenAI API Key set.")
 
+# 1. Define the State for the Graph
+class MessagesState(TypedDict):
+    messages: Annotated[list, add_messages]
 
-class State(TypedDict):
-    query: str
-    context: List[Document]
-    response: str
-
-
-def retrieve(state: State, retriever):
-    print("=== NODE: RETRIEVE ===")
-    query = state["query"]
-    context = retriever.invoke(query)
-    return {"context": context}
-
-
-def generate(state: State, llm):
-    print("=== NODE: GENERATE ===")
-    query = state["query"]
-    context = state["context"]
-
-    template = """Use the following pieces of context to answer the question at the end.
-    If you don't know the answer, just say that you don't know, don't try to make up an answer.
-    Use three sentences maximum and keep the answer as concise as possible.
-    Always say "thanks for asking!" at the end of the answer.
-
-    {context}
-
-    Question: {question}
-
-    Helpful Answer:"""
-
-    prompt = ChatPromptTemplate.from_template(template)
-
-    def format_docs(docs):
-        return "\n\n".join(d.page_content for d in docs)
-
-    rag_chain = prompt | llm | StrOutputParser()
-    response = rag_chain.invoke({"context": format_docs(context), "question": query})
-    return {"response": response}
-
-
-def init_llm():
-    llm = init_chat_model("gpt-4o-mini", model_provider="openai")
-    return llm
-
-
-def load_docs(web_path="https://lilianweng.github.io/posts/2023-06-23-agent/"):
-    bs4_strainer = bs4.SoupStrainer(
-        class_=("post-title", "post-header", "post-content")
-    )
-    loader = WebBaseLoader(
-        web_paths=[web_path],
-        bs_kwargs={"parse_only": bs4_strainer},
-    )
+# 2. Define the tool
+def setup_retriever():
+    print("=== NODE: SETUP RETRIEVER ===")
+    loader = WebBaseLoader(web_paths=["https://lilianweng.github.io/posts/2023-06-23-agent/"])
     docs = loader.load()
-    total_chars = sum(len(doc.page_content) for doc in docs)
-    print(f"Loaded {len(docs)} documents with total characters: {total_chars}")
-    return docs
-
-
-def split_docs(docs):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
         add_start_index=True,
         separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
     )
+    splitted_docs = text_splitter.split_documents(docs)
+    vectorstore = FAISS.from_documents(documents=splitted_docs, embedding=OpenAIEmbeddings())
+    return vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    all_splits = text_splitter.split_documents(docs)
-    print(f"Split the given document into {len(all_splits)} sub-documents.")
-    return all_splits
+retriever = setup_retriever()
 
+@tool
+def retrieve_documents(query: str) -> List[Document]:
+    """Looks up relevant documents from a knowledge base based on the user's query."""
+    print("=== TOOL: RETRIEVE ===")
+    retrieved_docs = retriever.invoke(query)
+    return [doc.__dict__ for doc in retrieved_docs]
 
-def add_documents(docs):
-    db = FAISS.from_documents(
-        docs, OpenAIEmbeddings(model="text-embedding-3-large"), normalize_L2=True
-    )
-    print(f"Indexed {len(db.docstore._dict)} documents.")
+# 3. Define the nodes - the "brain" of the agent
+def call_model(state: MessagesState, llm_with_tools):
+    print("=== NODE: CALL MODEL ===")
+    messages = state["messages"]
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
 
-    return db
+def call_tool(state: MessagesState):
+    last_message = state["messages"][-1]
 
+    tool_call = last_message.tool_calls[0]
+    if tool_call["name"] == "retrieve_documents":
+        tool_output = retrieve_documents.invoke(tool_call["args"])
+        return {"messages": [ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"])]}
+    return state
+
+# Conditional edge decides whether to continue the loop or end the graph
+def should_continue(state: MessagesState) -> str:
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        return END
+    return "call_tool"
 
 def main():
     print("Hello from python-rag!")
     set_openai_api_key()
-    llm = init_llm()
+    llm = init_chat_model("gpt-4o-mini", model_provider="openai")
 
-    docs = load_docs()
-    splitted_docs = split_docs(docs)
-
-    db = add_documents(docs=splitted_docs)
-
-    retriever = db.as_retriever(search_kwargs={"k": 4})
-    print("Created retriever.")
-
-    # Create partials for our nodes to "bake" the retriever and llm into the nodes
-    retrieve_node = partial(retrieve, retriever=retriever)
-    generate_node = partial(generate, llm=llm)
+    # Create a new llm with the tool bound to it
+    llm_with_tools = llm.bind_tools([retrieve_documents])
 
     # Create a new StateGraph with our defined state
-    workflow = StateGraph(State)
-    workflow.add_node("retrieve", retrieve_node)
-    workflow.add_node("generate", generate_node)
+    workflow = StateGraph(MessagesState)
+
+    # Use partial to "bake" the llm_with_tools into our node function
+    model_node = partial(call_model, llm_with_tools=llm_with_tools)
+
+    # Add nodes to the graph
+    workflow.add_node("agent", model_node)
+    workflow.add_node("call_tool", call_tool)
 
     # Define the flow of the graph
-    workflow.set_entry_point("retrieve")
-    workflow.add_edge("retrieve", "generate")
-    workflow.add_edge("generate", END)
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue, {
+        "call_tool": "call_tool",
+        END: END,
+    })
+    workflow.add_edge("call_tool", "agent")
 
     app = workflow.compile()
     print("Compiled workflow.")
@@ -141,15 +115,15 @@ def main():
 
     query = input("\nEnter your query: ")
     print("\n === Executing workflow === ")
-    final_states = app.invoke({"query": query})
+    final_state = app.invoke({"messages": [HumanMessage(content=query)]})
+    print("\n === Workflow completed === ")
 
-    print("\n === Workflow complete === ")
-    print(f"Context: {final_states['context']}\n\n")
-    print(f"Response: {final_states['response']}")
+    final_answer = final_state["messages"][-1]
+    print("Final answer: ", final_answer.content)
 
-    # For streaming the response
-    # for message, metadata in graph.stream({"query": query}, stream_mode="messages"):
-    #     print(message, end="|", flush=True)
+    print("\n === FULL MESSAGE HISTORY ===")
+    for message in final_state["messages"]:
+        print(f"**{message.type.upper()}**:\n{message.content}\n")
 
 
 if __name__ == "__main__":
